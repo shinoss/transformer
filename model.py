@@ -1,24 +1,15 @@
-import einops
 import torch.nn as nn
-import math
 import torch
-from typing import Optional
-
-
-def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    max_el = x.max(dim=dim,keepdim=True).values
-    x_stable = x - max_el
-    x_exp = torch.exp(x_stable)
-    x_out = x_exp / x_exp.sum(dim=dim, keepdim=True)
-    return x_out
-
+import einops
+import math
+from .utils import softmax
+from typing import Callable, Optional, Tuple
 
 def init_linear(weights, d_in, d_out):
     std = math.sqrt(2 / (d_in + d_out)) 
     min_init = -3.0 * std
     max_init = 3.0 * std
     torch.nn.init.trunc_normal_(weights, 0, std, min_init, max_init)
-
 
 class Linear(nn.Module):
     def __init__(self, d_in, d_out, device=None, dtype=None):
@@ -31,7 +22,6 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = einops.einsum(x, self.w, '... d_in, d_out d_in -> ... d_out')
         return out
-
 
 class Embedding(nn.Module):
     def __init__(self, num_embeddings, d_model, device=None, dtype=None):
@@ -142,7 +132,6 @@ class MHA(nn.Module):
         qkv = torch.matmul(x, self.qkv_proj.T)
 
         q, k, v = qkv.chunk(3, dim=-1)
-        assert q.shape[2] == k.shape[2]
 
         q = einops.rearrange(q, "... seq (h d) -> ... h seq d", h=self.num_heads)
         k = einops.rearrange(k, "... seq (h d) -> ... h seq d", h=self.num_heads)
@@ -151,7 +140,7 @@ class MHA(nn.Module):
             q = self.rope(q, token_positions) 
             k = self.rope(k, token_positions)
 
-        mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=k.device).tril()
 
         attn_out = sdpa(q, k, v, mask) # (bsz, num_heads, seq_len, d_head)
         attn_out = einops.rearrange(
@@ -195,6 +184,38 @@ class TransformerLM(nn.Module):
         self.ln_final = RMSNorm(d_model)
         # No weight tying here
         self.lm_head = Linear(d_model, vocab_size)
+        self.context_length = context_length
+
+    def sample(self, probs, top_p):
+        if top_p < 1.0:
+            sorted_probs, indices = torch.sort(probs, dim=-1, descending=True)
+            sorted_cumsum = torch.cumsum(sorted_probs, dim=-1)
+            discard = (sorted_cumsum - sorted_probs) > top_p
+            sorted_probs[discard] = 0
+            # renormalize after filtering
+            sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+            sampled_sorted = torch.multinomial(sorted_probs,1)
+            sampled = torch.gather(indices, -1, sampled_sorted)
+        else:
+            sampled = torch.multinomial(probs,1)
+        return sampled
+
+    def generate(self, prompt: torch.Tensor, num_generate: int, temp: float, top_p: float, eos_token_id: int):
+        generated = 0
+        while generated < num_generate:
+            logits = self.forward(prompt[:,-self.context_length:])
+            if temp == 0.0:
+                # greedy sampling
+                next_token_ids = torch.argmax(logits[:,-1,:], dim=-1, keepdim=True)
+            else:
+                next_token_probs = softmax(logits[:,-1,:], -1, temp)
+                next_token_ids = self.sample(next_token_probs, top_p)
+            if (next_token_ids[:,-1] == eos_token_id).any().item():
+                break;
+            prompt = torch.concat((prompt, next_token_ids),dim=-1)
+            generated += 1
+        # only return the newly generated tokens
+        return prompt[:, -num_generate:]
 
     def forward(self, x: torch.Tensor):
         embeddings = self.token_embeddings(x)

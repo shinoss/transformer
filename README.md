@@ -1,1 +1,1 @@
-simple transformer implementation. more soon
+simple transformer training
