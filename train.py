@@ -1,15 +1,16 @@
 import argparse
-import wandb
 from datetime import datetime
 import logging
 import torch
-from tokenizers import Tokenizer
+import tiktoken
 from pprint import pprint
+import wandb
+import os
 
-from .model import TransformerLM
-from .optimizer AdamW
-from .utils import cross_entropy
-from .data import MemoryMappedDataLoader, save_checkpoint
+from model import TransformerLM
+from optimizer import AdamW
+from utils import cross_entropy
+from data import MemoryMappedDataLoader, save_checkpoint
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,21 +32,20 @@ def create_args():
     parser.add_argument("--rope_theta", type=int, default=10_000)
 
     # optim related
-    parser.add_argument("--lr", type=float, default=4e-3)
+    parser.add_argument("--lr", type=float, default=7e-3)
     parser.add_argument("--eps", type=float, default=1e-8)
-    parser.add_argument("--b1", type=float, default=0.9)
-    parser.add_argument("--b2", type=float, default=0.95)
+    parser.add_argument("--b1", type=float, default=0.95)
+    parser.add_argument("--b2", type=float, default=0.99)
     parser.add_argument("--wd", type=float, default=1e-7)
 
     # data, default to TinyStories V2
-    parser.add_argument("--vocab_size", type=int, default=10_000)
+    parser.add_argument("--vocab_size", type=int, default=50257)
     parser.add_argument("--max-context", type=int, default=256)
-    parser.add_argument("--train-path", type=str, default="data/tinystories_10k_train.bin")
-    parser.add_argument("--tokenizer-path", type=str, default="data/tokenizer-tinystories-10k.json")
+    parser.add_argument("--train-path", type=str, default="yhshin1020/tinystories")
 
     # train
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--wandb", action="store_true", default=False)
     parser.add_argument("--max-iter", type=int, default=1000)
@@ -94,6 +94,25 @@ def create_model(args):
     model.to(device)
     return model
 
+
+def sample_text(
+    model: torch.nn.Module, 
+    sample_prompt, 
+    max_context_len: int, 
+    tokenizer, 
+    eos_token_id: int, 
+):
+    generated = model.generate(
+        sample_prompt, 
+        max_context_len, 
+        temp=args.temp,
+        top_p=args.top_p,
+        eos_token_id=eos_token_id
+    )
+    decoded = tokenizer.decode_batch(generated.cpu().tolist())
+    print(decoded[0])
+
+
 def train(args):
     config = create_config(args) 
     pprint(config)
@@ -106,6 +125,22 @@ def train(args):
     betas = (args.b1, args.b2)
     optim = AdamW(model.parameters(), args.lr, betas, args.eps, args.wd)
 
+    if args.wandb:
+        run = wandb.init(project=PROJECT, name=run_name, config=config)
+
+    model.train()
+    logger.info("Starting training...")
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    eos_token_id = tokenizer.encode(EOS_TOKEN, allowed_special={EOS_TOKEN})[0]
+    sample_prompt = torch.tensor(
+        [tokenizer.encode("Once upon a time there was a little boy named Ben")],
+        device=device,
+    )
+
+    print("Model output before training: ")
+    sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id=eos_token_id)
+
     dl = MemoryMappedDataLoader(
         ds_path=args.train_path,
         batch_size=args.batch_size,
@@ -113,27 +148,15 @@ def train(args):
         device=device,
     )
 
-    if args.wandb:
-        run = wandb.init(project=PROJECT, name=run_name, config=config)
-
-    model.train()
-    logger.info("Starting training...")
-
-    tokenizer = Tokenizer.from_file(args.tokenizer_save_path)
-
-    print("Model output before training: ")
-    sample_text(model, args.max_context, tokenizer, device)
-
     it = 0
 
     while it < args.max_iter:
         train, target = dl.get_batch()
 
         if it == 0:
-            decoded = tokenizer.decode_batch(train[0:1].cpu().tolist())
-            out = "".join(decoded)
+            decoded = tokenizer.decode(train[0].cpu().tolist())
             print("Sample training data: ")
-            print(out)
+            print(decoded)
 
         optim.zero_grad()
         pred = model(train)
@@ -146,33 +169,15 @@ def train(args):
         loss.backward()
         optim.step()
         if it > 0 and it % args.save_every == 0:
+            os.makedirs("outputs", exist_ok=True)
             save_path = f"outputs/{run_name}_iteration{it}"
-            logger.info(f"Saving checkpoint to {save_path}")
             save_checkpoint(model, optim, it, save_path)
             print(f"Model output at iteration {it}")
-            sample_text(model, args.max_context, tokenizer, device, save_path)
+            sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id=eos_token_id)
         it += 1
 
     if args.wandb:
         run.finish()
-
-
-def sample_text(model, max_context_len, tokenizer, device, ckpt_path=None):
-    if ckpt_path is not None:
-        state = torch.load(ckpt_path)
-        model.load_state_dict(state["model"])
-    eos_token_id = tokenizer.token_to_id(EOS_TOKEN)
-    prompt = torch.tensor([[0,1,2]], device=device)
-    generated = model.generate(
-        prompt, 
-        max_context_len, 
-        temp=args.temp,
-        top_p=args.top_p,
-        eos_token_id=eos_token_id
-    )
-    decoded = tokenizer.decode_batch(generated.cpu().tolist())
-    sample = "".join(decoded)
-    print(sample)
 
 if __name__ == "__main__":
     args = create_args()

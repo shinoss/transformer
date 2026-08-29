@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 import einops
 import math
-from .utils import softmax
+from utils import softmax
 from typing import Callable, Optional, Tuple
 
 def init_linear(weights, d_in, d_out):

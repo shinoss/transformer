@@ -1,0 +1,13 @@
+[project]
+name = "smallgpt"
+version = "0.0.1"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "huggingface_hub",
+  "torch",
+  "numpy",
+  "einops",
+  "tiktoken",
+  "wandb",
+]

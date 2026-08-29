@@ -1,6 +1,7 @@
 import torch
 import random
 import numpy as np
+from huggingface_hub import hf_hub_download
 
 def get_batch(dataset, batch_size: int, context_len: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     ds = torch.from_numpy(dataset).astype(np.int64)
@@ -15,13 +16,13 @@ def get_batch(dataset, batch_size: int, context_len: int, device: str) -> tuple[
 
 class MemoryMappedDataLoader:
     def __init__(self, ds_path: str, batch_size: int, context_len: int, device: str):
-        # self.ds = np.load(ds_path, mmap_mode='r') --> if using np.save() as .npy file
-        # memory mapped loading from numpy array of encoded ids post-tokenization
-        self.ds = np.memmap(
-            ds_path,
-            dtype=np.uint16,
-            mode="r",
+        path = hf_hub_download(
+            repo_id=ds_path,
+            filename="tinystoriesv2_train.bin",
+            repo_type="dataset",
         )
+        self.ds = np.memmap(path, dtype=np.uint16, mode="r")
+
         print(f"Loading dataset with {len(self.ds)} samples")
         self.batch_size = batch_size
         self.context_len = context_len
