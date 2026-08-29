@@ -3,6 +3,22 @@ import random
 import numpy as np
 from huggingface_hub import hf_hub_download
 
+def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int, date: str, time: str, out):
+    state = {
+        "it": iteration,
+        "date": date,
+        "time": time,
+        "model": model.state_dict(),
+        "optim": optimizer.state_dict(),
+    }
+    torch.save(state, out)
+
+def load_checkpoint(src, model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    state = torch.load(src)
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optim"])
+    return (int(state["it"]), state.get("date"), state.get("time"))
+
 def get_batch(dataset, batch_size: int, context_len: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     ds = torch.from_numpy(dataset).astype(np.int64)
     num_data = ds.shape[-1]
@@ -37,18 +53,3 @@ class MemoryMappedDataLoader:
         pred = pred.to(self.device)
         return (train, pred)
 
-
-def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int, out):
-    state = {
-        "it": iteration,
-        "model": model.state_dict(),
-        "optim": optimizer.state_dict(),
-    }
-    torch.save(state, out)
-
-
-def load_checkpoint(src, model: torch.nn.Module, optimizer: torch.optim.Optimizer):
-    state = torch.load(src)
-    model.load_state_dict(state["model"])
-    optimizer.load_state_dict(state["optim"])
-    return int(state["it"])

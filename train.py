@@ -8,11 +8,12 @@ import torch
 import tiktoken
 import wandb
 import sys
+from pathlib import Path
 
 from transformer.model import TransformerLM
 from transformer.optimizer import AdamW
 from transformer.utils import cross_entropy, cosine_annealing_lr, grad_clip
-from transformer.data import MemoryMappedDataLoader, save_checkpoint
+from transformer.data import MemoryMappedDataLoader, load_checkpoint, save_checkpoint
 
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,8 @@ image = (
     .uv_pip_install(["torch", "numpy", "tiktoken", "huggingface_hub", "wandb", "einops"])
     .add_local_python_source("transformer")
 )
+volume = modal.Volume.from_name("smallgpt-checkpoints", create_if_missing=True)
+CHECKPOINT_MOUNT_PATH = Path("/checkpoints")
 
 PROJECT = "small_gpt"
 EOS_TOKEN = "<|endoftext|>"
@@ -57,10 +60,11 @@ def create_args(arglist):
     parser.add_argument("--train-path", type=str, default="yhshin1020/tinystories:tinystoriesv2_train.bin")
 
     # train
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--wandb", action="store_true", default=False)
     parser.add_argument("--max-steps", type=int, default=100_000)
+    parser.add_argument("--resume-from-ckpt", type=str, default=None)
 
     # generation
     parser.add_argument("--temp", type=float, default=0.0)
@@ -92,6 +96,7 @@ def create_config(args):
         "trainer.save_every": args.save_every,
         "trainer.wandb": args.wandb,
         "trainer.max_steps": args.max_steps,
+        "trainer.resume_from_ckpt": args.resume_from_ckpt,
         "gen.temp": args.temp,
         "gen.top_p": args.top_p,
     }
@@ -144,6 +149,7 @@ def get_device():
         modal.Secret.from_name("wandb-secret"),
     ],
     timeout=3600, # 1h timeout
+    volumes={CHECKPOINT_MOUNT_PATH: volume},
 )
 def train(*arglist):
     args = create_args(arglist)
@@ -162,19 +168,38 @@ def train(*arglist):
     device = get_device()
     logger.info(f"Running on {device}")
 
+    dl = MemoryMappedDataLoader(
+        ds_path=args.train_path,
+        batch_size=args.batch_size,
+        context_len=args.max_context,
+        device=device,
+    )
+
+    step = 0
+
     model = create_model(args)
     model.to(device)
     logger.info(f"Model size: {model.get_size_gb():.2f}GB")
 
-    betas = (args.b1, args.b2)
-    optim = AdamW(model.parameters(), args.lr, betas, args.eps, args.wd)
     max_lr = args.lr
     min_lr = args.lr * args.min_lr_multiplier
+    betas = (args.b1, args.b2)
+    optim = AdamW(model.parameters(), args.lr, betas, args.eps, args.wd)
+
+    if args.resume_from_ckpt:
+        load_path = CHECKPOINT_MOUNT_PATH / args.resume_from_ckpt
+        last_step, date_ckpt, time_ckpt = load_checkpoint(load_path, model, optim)
+        step = last_step + 1
+        created_msg = ""
+        if date_ckpt is not None and time_ckpt is not None:
+            date = date_ckpt
+            time = time_ckpt 
+            created_msg = f"(created on {date}:{time})"
+        logger.info(f"Resuming training from checkpoint {args.resume_from_ckpt} {created_msg} from step={step}")
 
     if args.wandb:
         run = wandb.init(project=PROJECT, name=run_name, config=config)
 
-    model.train()
     logger.info("Starting training...")
 
     tokenizer = tiktoken.get_encoding("gpt2")
@@ -186,15 +211,9 @@ def train(*arglist):
 
     print("Model output before training: ")
     sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id, args.temp, args.top_p)
+    print("=" * 30)
 
-    dl = MemoryMappedDataLoader(
-        ds_path=args.train_path,
-        batch_size=args.batch_size,
-        context_len=args.max_context,
-        device=device,
-    )
-
-    step = 0
+    model.train()
 
     while step < args.max_steps:
         # mem_allocated = torch.cuda.memory_allocated()
@@ -206,6 +225,7 @@ def train(*arglist):
             decoded = tokenizer.decode(train[0].cpu().tolist())
             print("Sample training data: ")
             print(decoded)
+            print("=" * 30)
 
         optim.zero_grad()
         pred = model(train)
@@ -213,7 +233,7 @@ def train(*arglist):
 
         if step % args.log_every == 0:
             loss_cpu = loss.cpu().item()
-            logger.info(f"Train loss at step {step}: {loss_cpu}")
+            logger.info(f"[Step {step}] Train loss: {loss_cpu}")
             if args.wandb: 
                 run.log({"loss": loss_cpu}, step=step)
 
@@ -230,10 +250,9 @@ def train(*arglist):
         del loss
 
         if step > 0 and step % args.save_every == 0:
-            os.makedirs("outputs", exist_ok=True)
-            save_path = f"outputs/{run_name}_step{step}"
-            save_checkpoint(model, optim, step, save_path)
-            print(f"Model output at step {step}")
+            save_path = CHECKPOINT_MOUNT_PATH / f"{run_name}_step_{step}"
+            save_checkpoint(model, optim, step, date, time, save_path)
+            print(f"[Step {step}] Model Output:")
             sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id, args.temp, args.top_p)
         step += 1
 
