@@ -7,10 +7,11 @@ from pprint import pprint
 import torch
 import tiktoken
 import wandb
+import sys
 
 from transformer.model import TransformerLM
 from transformer.optimizer import AdamW
-from transformer.utils import cross_entropy
+from transformer.utils import cross_entropy, cosine_annealing_lr, grad_clip
 from transformer.data import MemoryMappedDataLoader, save_checkpoint
 
 
@@ -38,11 +39,17 @@ def create_args(arglist):
     parser.add_argument("--rope_theta", type=int, default=10_000)
 
     # optim related
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=7e-3)
     parser.add_argument("--eps", type=float, default=1e-8)
-    parser.add_argument("--b1", type=float, default=0.95)
-    parser.add_argument("--b2", type=float, default=0.99)
+    parser.add_argument("--b1", type=float, default=0.9)
+    parser.add_argument("--b2", type=float, default=0.95)
     parser.add_argument("--wd", type=float, default=1e-7)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--cosine-steps", type=int, default=10_000)
+    # final learning rate is 10% of one specified by --lr
+    parser.add_argument("--min-lr-multiplier", type=int, default=1e-1)
 
     # data, default to TinyStories V2
     parser.add_argument("--vocab_size", type=int, default=50257)
@@ -50,12 +57,10 @@ def create_args(arglist):
     parser.add_argument("--train-path", type=str, default="yhshin1020/tinystories:tinystoriesv2_train.bin")
 
     # train
-    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--wandb", action="store_true", default=False)
-    parser.add_argument("--max-iter", type=int, default=1000)
-    parser.add_argument("--load-ckpt-path", type=str, default=None)
+    parser.add_argument("--max-steps", type=int, default=100_000)
 
     # generation
     parser.add_argument("--temp", type=float, default=0.0)
@@ -71,18 +76,22 @@ def create_config(args):
         "model.num_heads": args.num_heads,
         "model.num_layers": args.num_layers,
         "model.rope_theta": args.rope_theta,
+        "optim.batch_size": args.batch_size,
         "optim.lr": args.lr,
         "optim.betas": (args.b1, args.b2),
-        "optim.weight_decay": args.wd,
         "optim.eps": args.eps,
+        "optim.weight_decay": args.wd,
+        "optim.max_grad_norm": args.max_grad_norm,
+        "optim.warmup_steps": args.warmup_steps,
+        "optim.cosine_steps": args.cosine_steps,
+        "optim.min_lr_multiplier": args.min_lr_multiplier,
         "data.vocab_size": args.vocab_size,
         "data.max_context_length": args.max_context,
         "data.train_path": args.train_path,
-        "trainer.batch_size": args.batch_size,
         "trainer.log_every": args.log_every,
         "trainer.save_every": args.save_every,
         "trainer.wandb": args.wandb,
-        "trainer.max_iter": args.max_iter,
+        "trainer.max_steps": args.max_steps,
         "gen.temp": args.temp,
         "gen.top_p": args.top_p,
     }
@@ -159,6 +168,8 @@ def train(*arglist):
 
     betas = (args.b1, args.b2)
     optim = AdamW(model.parameters(), args.lr, betas, args.eps, args.wd)
+    max_lr = args.lr
+    min_lr = args.lr * args.min_lr_multiplier
 
     if args.wandb:
         run = wandb.init(project=PROJECT, name=run_name, config=config)
@@ -183,14 +194,15 @@ def train(*arglist):
         device=device,
     )
 
-    it = 0
+    step = 0
 
-    while it < args.max_iter:
+    while step < args.max_steps:
         # mem_allocated = torch.cuda.memory_allocated()
-        # logger.info(f"Iteration {it}: memory allocated: {mem_allocated/1024**3}")
+        # logger.info(f"Iteration {step}: memory allocated: {mem_allocated/1024**3}")
+
         train, target = dl.get_batch()
 
-        if it == 0:
+        if step == 0:
             decoded = tokenizer.decode(train[0].cpu().tolist())
             print("Sample training data: ")
             print(decoded)
@@ -199,23 +211,31 @@ def train(*arglist):
         pred = model(train)
         loss = cross_entropy(pred, target)
 
-        if it % args.log_every == 0:
+        if step % args.log_every == 0:
             loss_cpu = loss.cpu().item()
-            logger.info(f"Train loss at iteration {it}: {loss_cpu}")
+            logger.info(f"Train loss at step {step}: {loss_cpu}")
             if args.wandb: 
-                run.log({"loss": loss_cpu}, step=it)
+                run.log({"loss": loss_cpu}, step=step)
 
         loss.backward()
-        optim.step()
-        del loss, pred
 
-        if it > 0 and it % args.save_every == 0:
+        new_lr = cosine_annealing_lr(max_lr, min_lr, args.warmup_steps, args.cosine_steps, step)
+        for group in optim.param_groups:
+            group["lr"] = new_lr
+
+        grad_clip(model.parameters(), args.max_grad_norm, args.eps)
+
+        optim.step()
+        del pred
+        del loss
+
+        if step > 0 and step % args.save_every == 0:
             os.makedirs("outputs", exist_ok=True)
-            save_path = f"outputs/{run_name}_iteration{it}"
-            save_checkpoint(model, optim, it, save_path)
-            print(f"Model output at iteration {it}")
+            save_path = f"outputs/{run_name}_step{step}"
+            save_checkpoint(model, optim, step, save_path)
+            print(f"Model output at step {step}")
             sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id, args.temp, args.top_p)
-        it += 1
+        step += 1
 
     if args.wandb:
         run.finish()
@@ -227,4 +247,4 @@ def modal_local(*arglist):
 
 
 if __name__ == "__main__":
-    train.local()
+    train.local(*sys.argv[1:])

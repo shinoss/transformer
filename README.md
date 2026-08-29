@@ -15,5 +15,5 @@ run on modal:
 modal run train.py
 ```
 
-
+to log results to wandb, use `--wandb` (false by default)
 

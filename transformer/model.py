@@ -152,7 +152,14 @@ class MHA(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, num_heads: int, theta: Optional[float] = None, max_seq_len: Optional[int] = None): 
+    def __init__(
+        self, 
+        d_model: int, 
+        d_ff: int,
+        num_heads: int,
+        theta: Optional[float] = None, 
+        max_seq_len: Optional[int] = None
+    ): 
         super().__init__()
         self.attn = MHA(d_model, num_heads, theta, max_seq_len)
         self.ln1 = RMSNorm(d_model)
