@@ -163,7 +163,6 @@ def train(*arglist):
 
     date = datetime.now().strftime("%m%d")
     time = datetime.now().strftime("%H%M")
-    run_name = f"run_{date}_{time}"
 
     device = get_device()
     logger.info(f"Running on {device}")
@@ -199,6 +198,8 @@ def train(*arglist):
 
     if args.wandb:
         run = wandb.init(project=PROJECT, name=run_name, config=config)
+
+    run_name = f"run_{date}_{time}"
 
     logger.info("Starting training...")
 
