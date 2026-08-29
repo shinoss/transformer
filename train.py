@@ -1,27 +1,33 @@
 import argparse
 from datetime import datetime
 import logging
+import modal
+import os
+from pprint import pprint
 import torch
 import tiktoken
-from pprint import pprint
 import wandb
-import os
 
-from model import TransformerLM
-from optimizer import AdamW
-from utils import cross_entropy
-from data import MemoryMappedDataLoader, save_checkpoint
+from transformer.model import TransformerLM
+from transformer.optimizer import AdamW
+from transformer.utils import cross_entropy
+from transformer.data import MemoryMappedDataLoader, save_checkpoint
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-logger.info(f"Running on {device}")
+app = modal.App("smallgpt")
+image = (
+    modal.Image.debian_slim()
+    .uv_pip_install(["torch", "numpy", "tiktoken", "huggingface_hub", "wandb", "einops"])
+    .add_local_python_source("transformer")
+)
 
 PROJECT = "small_gpt"
 EOS_TOKEN = "<|endoftext|>"
 
-def create_args():
+def create_args(arglist):
     parser = argparse.ArgumentParser("simple training script")
 
     # model (17M params, excl. embeddings)
@@ -41,7 +47,7 @@ def create_args():
     # data, default to TinyStories V2
     parser.add_argument("--vocab_size", type=int, default=50257)
     parser.add_argument("--max-context", type=int, default=256)
-    parser.add_argument("--train-path", type=str, default="yhshin1020/tinystories")
+    parser.add_argument("--train-path", type=str, default="yhshin1020/tinystories:tinystoriesv2_train.bin")
 
     # train
     parser.add_argument("--batch-size", type=int, default=64)
@@ -55,7 +61,7 @@ def create_args():
     parser.add_argument("--temp", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.9)
 
-    args = parser.parse_args()
+    args = parser.parse_args(args=arglist)
     return args
 
 def create_config(args):
@@ -91,7 +97,6 @@ def create_model(args):
         args.num_heads, 
         args.rope_theta
     )
-    model.to(device)
     return model
 
 
@@ -101,19 +106,43 @@ def sample_text(
     max_context_len: int, 
     tokenizer, 
     eos_token_id: int, 
+    temp: float,
+    top_p: float,
 ):
     generated = model.generate(
         sample_prompt, 
         max_context_len, 
-        temp=args.temp,
-        top_p=args.top_p,
+        temp=temp,
+        top_p=top_p,
         eos_token_id=eos_token_id
     )
     decoded = tokenizer.decode_batch(generated.cpu().tolist())
     print(decoded[0])
 
 
-def train(args):
+def get_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+@app.function(
+    gpu="A100-40GB", 
+    image=image,
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    timeout=3600, # 1h timeout
+)
+def train(*arglist):
+    args = create_args(arglist)
+
+    if "HF_TOKEN" in os.environ:
+        from huggingface_hub import login
+        login(token=os.environ["HF_TOKEN"])
+
     config = create_config(args) 
     pprint(config)
 
@@ -121,7 +150,13 @@ def train(args):
     time = datetime.now().strftime("%H%M")
     run_name = f"run_{date}_{time}"
 
+    device = get_device()
+    logger.info(f"Running on {device}")
+
     model = create_model(args)
+    model.to(device)
+    logger.info(f"Model size: {model.get_size_gb():.2f}GB")
+
     betas = (args.b1, args.b2)
     optim = AdamW(model.parameters(), args.lr, betas, args.eps, args.wd)
 
@@ -139,7 +174,7 @@ def train(args):
     )
 
     print("Model output before training: ")
-    sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id=eos_token_id)
+    sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id, args.temp, args.top_p)
 
     dl = MemoryMappedDataLoader(
         ds_path=args.train_path,
@@ -151,6 +186,8 @@ def train(args):
     it = 0
 
     while it < args.max_iter:
+        # mem_allocated = torch.cuda.memory_allocated()
+        # logger.info(f"Iteration {it}: memory allocated: {mem_allocated/1024**3}")
         train, target = dl.get_batch()
 
         if it == 0:
@@ -161,24 +198,33 @@ def train(args):
         optim.zero_grad()
         pred = model(train)
         loss = cross_entropy(pred, target)
+
         if it % args.log_every == 0:
             loss_cpu = loss.cpu().item()
-            logger.info(f"Train loss at iter {it}: {loss_cpu}")
+            logger.info(f"Train loss at iteration {it}: {loss_cpu}")
             if args.wandb: 
                 run.log({"loss": loss_cpu}, step=it)
+
         loss.backward()
         optim.step()
+        del loss, pred
+
         if it > 0 and it % args.save_every == 0:
             os.makedirs("outputs", exist_ok=True)
             save_path = f"outputs/{run_name}_iteration{it}"
             save_checkpoint(model, optim, it, save_path)
             print(f"Model output at iteration {it}")
-            sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id=eos_token_id)
+            sample_text(model, sample_prompt, args.max_context, tokenizer, eos_token_id, args.temp, args.top_p)
         it += 1
 
     if args.wandb:
         run.finish()
 
+
+@app.local_entrypoint()
+def modal_local(*arglist):
+    train.remote(*arglist)
+
+
 if __name__ == "__main__":
-    args = create_args()
-    train(args)
+    train.local()

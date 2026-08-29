@@ -16,9 +16,10 @@ def get_batch(dataset, batch_size: int, context_len: int, device: str) -> tuple[
 
 class MemoryMappedDataLoader:
     def __init__(self, ds_path: str, batch_size: int, context_len: int, device: str):
+        repo, filename = ds_path.split(":")
         path = hf_hub_download(
-            repo_id=ds_path,
-            filename="tinystoriesv2_train.bin",
+            repo_id=repo,
+            filename=filename,
             repo_type="dataset",
         )
         self.ds = np.memmap(path, dtype=np.uint16, mode="r")

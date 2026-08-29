@@ -2,8 +2,9 @@ import torch.nn as nn
 import torch
 import einops
 import math
-from utils import softmax
 from typing import Callable, Optional, Tuple
+
+from .utils import softmax
 
 def init_linear(weights, d_in, d_out):
     std = math.sqrt(2 / (d_in + d_out)) 
@@ -200,21 +201,33 @@ class TransformerLM(nn.Module):
             sampled = torch.multinomial(probs,1)
         return sampled
 
+    def get_size_gb(self):
+        param_size = 0
+        for param in self.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in self.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        size_in_gb = (param_size + buffer_size) / 1024**3
+        return size_in_gb
+
+
     def generate(self, prompt: torch.Tensor, num_generate: int, temp: float, top_p: float, eos_token_id: int):
-        generated = 0
-        while generated < num_generate:
-            logits = self.forward(prompt[:,-self.context_length:])
-            if temp == 0.0:
-                # greedy sampling
-                next_token_ids = torch.argmax(logits[:,-1,:], dim=-1, keepdim=True)
-            else:
-                next_token_probs = softmax(logits[:,-1,:], -1, temp)
-                next_token_ids = self.sample(next_token_probs, top_p)
-            if (next_token_ids[:,-1] == eos_token_id).any().item():
-                break;
-            prompt = torch.concat((prompt, next_token_ids),dim=-1)
-            generated += 1
-        # only return the newly generated tokens
+        with torch.inference_mode():
+            generated = 0
+            while generated < num_generate:
+                logits = self.forward(prompt[:,-self.context_length:])
+                if temp == 0.0:
+                    # greedy sampling
+                    next_token_ids = torch.argmax(logits[:,-1,:], dim=-1, keepdim=True)
+                else:
+                    next_token_probs = softmax(logits[:,-1,:], -1, temp)
+                    next_token_ids = self.sample(next_token_probs, top_p)
+                if (next_token_ids[:,-1] == eos_token_id).any().item():
+                    break;
+                prompt = torch.concat((prompt, next_token_ids),dim=-1)
+                generated += 1
+            # only return the newly generated tokens
         return prompt[:, -num_generate:]
 
     def forward(self, x: torch.Tensor):
